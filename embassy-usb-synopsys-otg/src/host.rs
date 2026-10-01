@@ -14,7 +14,10 @@ use embassy_usb_driver::{EndpointInfo, EndpointType, Speed};
 use portable_atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 
 use crate::PhyType;
-use crate::otg_v1::{Otg, vals};
+use crate::otg_v1::{Otg, regs, vals};
+
+#[cfg(test)]
+mod tests;
 
 // Per-channel event flags, OR'd into an AtomicU16 mailbox by the ISR.
 const EV_XFRC: u16 = 1 << 0;
@@ -46,21 +49,33 @@ const PORT_EVENT_DISCONNECTED: u8 = 1 << 1;
 const PORT_EVENT_ENABLED: u8 = 1 << 2;
 const PORT_EVENT_OVERCURRENT: u8 = 1 << 3;
 
+// Large enough for one maximum-size USB packet. Larger transfers use packet-aligned chunks.
+const RX_BUFFER_SIZE: usize = 1024;
+
 /// Per-channel state for interrupt communication.
 struct ChannelState {
     waker: AtomicWaker,
     /// Accumulated `EV_*` event flags.
     result: AtomicU16,
-    /// Buffer pointer for RX FIFO reads.
-    rx_buffer: UnsafeCell<*mut u8>,
+    /// Driver-owned staging storage; never points into a transfer future or its caller.
+    rx_buffer: UnsafeCell<[u8; RX_BUFFER_SIZE]>,
     /// Number of bytes received into the buffer.
     rx_count: UnsafeCell<usize>,
     /// Buffer capacity.
     rx_capacity: UnsafeCell<usize>,
+    /// Includes zero-length packets, which also advance the DATA PID.
+    rx_packets: UnsafeCell<usize>,
+    /// Next DATA PID, retained until the hardware and queued RX statuses are drained.
+    rx_next_toggle: UnsafeCell<Option<bool>>,
+    /// Whether FIFO data belongs to a configured IN transfer.
+    rx_active: UnsafeCell<bool>,
+    /// Whether the ISR may schedule another packet for the active transfer.
+    rx_rearm: UnsafeCell<bool>,
     allocated: AtomicBool,
 }
 
-// SAFETY: Buffer access is synchronized between ISR and poll_fn via result atomic.
+// SAFETY: Every access to the RX fields is protected by the host state mutex.
+// No references into these fields escape its lock; the remaining fields are atomic.
 unsafe impl Send for ChannelState {}
 unsafe impl Sync for ChannelState {}
 
@@ -71,6 +86,9 @@ struct HostStateFields {
 }
 
 /// Storage object for USB host driver state. Create one per OTG instance.
+///
+/// Includes a 1024-byte receive staging buffer per channel. Pending transfers may
+/// be dropped or forgotten without retaining pointers to caller-owned buffers.
 pub struct HostStateStorage<const CH_COUNT: usize, M = CriticalSectionRawMutex>
 where
     M: RawMutex + Copy,
@@ -91,9 +109,13 @@ where
                 ChannelState {
                     waker: AtomicWaker::new(),
                     result: AtomicU16::new(0),
-                    rx_buffer: UnsafeCell::new(core::ptr::null_mut()),
+                    rx_buffer: UnsafeCell::new([0; RX_BUFFER_SIZE]),
                     rx_count: UnsafeCell::new(0),
                     rx_capacity: UnsafeCell::new(0),
+                    rx_packets: UnsafeCell::new(0),
+                    rx_next_toggle: UnsafeCell::new(None),
+                    rx_active: UnsafeCell::new(false),
+                    rx_rearm: UnsafeCell::new(false),
                     allocated: AtomicBool::new(false),
                 }
             }; CH_COUNT],
@@ -245,106 +267,7 @@ where
     }
 
     // RX FIFO non-empty (IN data received)
-    while r.gintsts().read().rxflvl() {
-        let status = r.grxstsp().read();
-        let ch_num = status.epnum() as usize; // In host mode, epnum field is channel number
-        let len = status.bcnt() as usize;
-        trace!(
-            "otg-host: rxfifo ch={} pktsts={} bcnt={} dpid={}",
-            ch_num,
-            status.pktstsh().to_bits(),
-            len,
-            status.dpid().to_bits(),
-        );
-
-        if ch_num >= ch_count {
-            // Discard unexpected data
-            let words = (len + 3) / 4;
-            for _ in 0..words {
-                r.fifo(0).read();
-            }
-            continue;
-        }
-
-        match status.pktstsh() {
-            vals::Pktstsh::IN_DATA_RX => {
-                // Read data from FIFO into channel buffer
-                let ch_state = &state.channels[ch_num];
-                let buf_ptr = unsafe { *ch_state.rx_buffer.get() };
-                let count = unsafe { *ch_state.rx_count.get() };
-                let capacity = unsafe { *ch_state.rx_capacity.get() };
-
-                let available = capacity.saturating_sub(count);
-                let to_copy = len.min(available);
-
-                if !buf_ptr.is_null() && to_copy > 0 {
-                    let dst = unsafe { buf_ptr.add(count) };
-                    let mut remaining = to_copy;
-                    let mut offset = 0;
-                    while remaining >= 4 {
-                        let word = r.fifo(0).read().0;
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(word.to_ne_bytes().as_ptr(), dst.add(offset), 4);
-                        }
-                        offset += 4;
-                        remaining -= 4;
-                    }
-                    if remaining > 0 {
-                        let word = r.fifo(0).read().0;
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(word.to_ne_bytes().as_ptr(), dst.add(offset), remaining);
-                        }
-                    }
-                    unsafe {
-                        *ch_state.rx_count.get() = count + to_copy;
-                    }
-
-                    // Discard any remaining bytes we couldn't store (buffer was smaller than packet)
-                    if to_copy < len {
-                        // We already read ceil(to_copy/4) words; drain the rest.
-                        let words_read = (to_copy + 3) / 4;
-                        let total_words = (len + 3) / 4;
-                        for _ in words_read..total_words {
-                            r.fifo(0).read();
-                        }
-                    }
-                } else {
-                    // Discard all data if buffer full or null
-                    let words = (len + 3) / 4;
-                    for _ in 0..words {
-                        r.fifo(0).read();
-                    }
-                }
-            }
-            vals::Pktstsh::IN_DATA_DONE | vals::Pktstsh::DATA_TOGGLE_ERR | vals::Pktstsh::CHANNEL_HALTED => {
-                // These don't have FIFO data to read
-            }
-            _ => {
-                // Unknown status, discard any data
-                let words = (len + 3) / 4;
-                for _ in 0..words {
-                    r.fifo(0).read();
-                }
-            }
-        }
-
-        // Slave-mode multi-packet IN quirk: after each received data packet
-        // the DWC2 core dequeues this channel from its transaction scheduler
-        // even though HCCHAR.CHENA stays at 1 and HCTSIZ.PKTCNT > 0. Writing
-        // CHENA=1 again re-queues the channel for the next IN token. Without
-        // this, multi-packet bulk/interrupt IN transfers stop after the
-        // first packet. In DMA modes the core self-schedules; STM32 OTG
-        // runs in slave mode so software must re-arm per packet.
-        if ch_num < ch_count && matches!(status.pktstsh(), vals::Pktstsh::IN_DATA_RX) {
-            let hctsiz = r.hctsiz(ch_num).read();
-            if hctsiz.pktcnt() > 0 {
-                r.hcchar(ch_num).modify(|w| {
-                    w.set_chena(true);
-                    w.set_chdis(false);
-                });
-            }
-        }
-    }
+    read_rx_fifo(r, state);
 
     // Host channel interrupts
     if gintsts.hcint() {
@@ -352,50 +275,149 @@ where
 
         for ch in 0..ch_count {
             if haint & (1 << ch) != 0 {
-                let hcint = r.hcint(ch).read();
+                let events = state.mutex.lock(|| {
+                    let hcint = r.hcint(ch).read();
 
-                // Accumulate every bit; NAK and the auto-halt CHH can co-occur.
-                let mut events: u16 = 0;
-                if hcint.xfrc() {
-                    events |= EV_XFRC;
-                }
-                if hcint.stall() {
-                    events |= EV_STALL;
-                }
-                if hcint.bberr() {
-                    events |= EV_BBERR;
-                }
-                if hcint.txerr() {
-                    events |= EV_TXERR;
-                }
-                if hcint.dterr() {
-                    events |= EV_DTERR;
-                }
-                if hcint.frmor() {
-                    events |= EV_FRMOR;
-                }
-                if hcint.0 & HCINT_NYET_MASK != 0 {
-                    events |= EV_NYET;
-                }
-                if hcint.nak() {
-                    events |= EV_NAK;
-                }
-                if hcint.chh() {
-                    events |= EV_CHH;
-                }
+                    let events = channel_events(hcint);
 
-                trace!(
-                    "otg-host: hcint ch={} raw={:#010x} -> events={:#06x}",
-                    ch, hcint.0, events
-                );
+                    trace!(
+                        "otg-host: hcint ch={} raw={:#010x} -> events={:#06x}",
+                        ch, hcint.0, events
+                    );
 
-                // Clear all channel interrupts
-                r.hcint(ch).write_value(hcint);
+                    // Clear all channel interrupts
+                    r.hcint(ch).write_value(hcint);
 
+                    if events != 0 {
+                        state.channels[ch].result.fetch_or(events, Ordering::Release);
+                    }
+                    events
+                });
                 if events != 0 {
-                    state.channels[ch].result.fetch_or(events, Ordering::Release);
                     state.channels[ch].waker.wake();
                 }
+            }
+        }
+    }
+}
+
+fn channel_events(hcint: regs::Hcint) -> u16 {
+    // Accumulate every bit; NAK and the auto-halt CHH can co-occur.
+    let mut events: u16 = 0;
+    if hcint.xfrc() {
+        events |= EV_XFRC;
+    }
+    if hcint.stall() {
+        events |= EV_STALL;
+    }
+    if hcint.bberr() {
+        events |= EV_BBERR;
+    }
+    if hcint.txerr() {
+        events |= EV_TXERR;
+    }
+    if hcint.dterr() {
+        events |= EV_DTERR;
+    }
+    if hcint.frmor() {
+        events |= EV_FRMOR;
+    }
+    if hcint.0 & HCINT_NYET_MASK != 0 {
+        events |= EV_NYET;
+    }
+    if hcint.nak() {
+        events |= EV_NAK;
+    }
+    if hcint.chh() {
+        events |= EV_CHH;
+    }
+
+    events
+}
+
+/// Drain queued receive statuses while excluding the task that copies or resets RX storage.
+fn read_rx_fifo<M: RawMutex + Copy>(r: Otg, state: &HostState<'_, M>) {
+    state.mutex.lock(|| {
+        while r.gintsts().read().rxflvl() {
+            let status = r.grxstsp().read();
+            // SAFETY: All channel RX storage is protected by the state mutex.
+            unsafe { read_rx_packet(r, state.channels, status) };
+        }
+    });
+}
+
+/// Read one popped receive status. The host state mutex must be held.
+unsafe fn read_rx_packet(r: Otg, channels: &[ChannelState], status: regs::Grxsts) {
+    let ch_num = status.epnum() as usize; // In host mode, epnum field is channel number
+    let len = status.bcnt() as usize;
+    trace!(
+        "otg-host: rxfifo ch={} pktsts={} bcnt={} dpid={}",
+        ch_num,
+        status.pktstsh().to_bits(),
+        len,
+        status.dpid().to_bits(),
+    );
+
+    let Some(ch_state) = channels.get(ch_num) else {
+        // Discard unexpected data
+        for _ in 0..len.div_ceil(4) {
+            r.fifo(0).read();
+        }
+        return;
+    };
+
+    match status.pktstsh() {
+        vals::Pktstsh::IN_DATA_RX => {
+            // Read data from FIFO into channel buffer. The storage outlives every
+            // transfer, including futures that are cancelled without running Drop.
+            // A packet acknowledged before a cancelled transfer halts still
+            // advances the endpoint's PID, even when its payload is discarded.
+            if let Some(toggle) = unsafe { &mut *ch_state.rx_next_toggle.get() } {
+                *toggle = !*toggle;
+            }
+            let active = unsafe { *ch_state.rx_active.get() };
+            let count = unsafe { *ch_state.rx_count.get() };
+            let capacity = unsafe { *ch_state.rx_capacity.get() };
+            let to_copy = if active { len.min(capacity - count) } else { 0 };
+            let buffer = unsafe { &mut *ch_state.rx_buffer.get() };
+            for chunk in buffer[count..count + to_copy].chunks_mut(4) {
+                let word = r.fifo(0).read().0.to_ne_bytes();
+                chunk.copy_from_slice(&word[..chunk.len()]);
+            }
+            // We already read ceil(to_copy/4) words; drain the rest, including
+            // all data for inactive channels or packets larger than the buffer.
+            for _ in to_copy.div_ceil(4)..len.div_ceil(4) {
+                r.fifo(0).read();
+            }
+            if active {
+                unsafe {
+                    *ch_state.rx_count.get() = count + to_copy;
+                    *ch_state.rx_packets.get() += 1;
+                }
+            }
+
+            // Slave-mode multi-packet IN quirk: after each received data packet
+            // the DWC2 core dequeues this channel from its transaction scheduler
+            // even though HCCHAR.CHENA stays at 1 and HCTSIZ.PKTCNT > 0. Writing
+            // CHENA=1 again re-queues the channel for the next IN token. Without
+            // this, multi-packet bulk/interrupt IN transfers stop after the
+            // first packet. In DMA modes the core self-schedules; STM32 OTG
+            // runs in slave mode so software must re-arm per packet.
+            // Do not revive a channel that is being halted for reuse.
+            if active && unsafe { *ch_state.rx_rearm.get() } && r.hctsiz(ch_num).read().pktcnt() > 0 {
+                r.hcchar(ch_num).modify(|w| {
+                    w.set_chena(true);
+                    w.set_chdis(false);
+                });
+            }
+        }
+        vals::Pktstsh::IN_DATA_DONE | vals::Pktstsh::DATA_TOGGLE_ERR | vals::Pktstsh::CHANNEL_HALTED => {
+            // These don't have FIFO data to read
+        }
+        _ => {
+            // Unknown status, discard any data
+            for _ in 0..len.div_ceil(4) {
+                r.fifo(0).read();
             }
         }
     }
@@ -623,6 +645,9 @@ where
     ) -> Result<Self::Pipe<T, D>, HostError> {
         let ep_number = endpoint.addr.index() as u8;
         let max_packet_size = endpoint.max_packet_size;
+        if max_packet_size == 0 || usize::from(max_packet_size) > RX_BUFFER_SIZE {
+            return Err(HostError::InvalidDescriptor);
+        }
 
         // Read root-port speed from port_speed atomic (stored by ISR)
         let speed_code = self.state.fields.port_speed.load(Ordering::Acquire);
@@ -650,6 +675,11 @@ where
                 .is_ok()
             {
                 self.state.channels[i].result.store(0, Ordering::Release);
+                // This is a new endpoint allocation, not a continuation of the
+                // previous owner's toggle sequence. Its late packets are discarded.
+                self.state.mutex.lock(|| unsafe {
+                    *self.state.channels[i].rx_next_toggle.get() = None;
+                });
 
                 return Ok(Channel {
                     regs: self.regs,
@@ -894,12 +924,12 @@ where
     phantom: PhantomData<(T, D)>,
 }
 
-// SAFETY: Channel only accesses its own state in the shared HostState.
+// SAFETY: RX storage is accessed under the shared mutex, which must be safe to share between threads.
 unsafe impl<T, D, M> Send for Channel<'_, T, D, M>
 where
     T: pipe::Type,
     D: pipe::Direction,
-    M: RawMutex + Copy,
+    M: RawMutex + Copy + Sync,
 {
 }
 
@@ -912,6 +942,10 @@ where
     fn drop(&mut self) {
         let r = self.regs;
         let ch = self.index;
+
+        // Stop accepting RX packets before requesting a halt. In particular, the
+        // ISR must not re-arm this channel while it is being released.
+        self.clear_rx_buffer();
 
         // Request the hardware to halt this channel. We can't wait for
         // completion (Drop is synchronous), but the halt ensures the
@@ -947,7 +981,7 @@ where
     D: pipe::Direction,
     M: RawMutex + Copy,
 {
-    fn configure_channel(&self, dir_in: bool, ep_type: EndpointType, pktcnt: u16, xfrsiz: u32, dpid: u8) {
+    fn configure_channel(&mut self, dir_in: bool, ep_type: EndpointType, pktcnt: u16, xfrsiz: u32, dpid: u8) {
         let r = self.regs;
         let ch = self.index;
         trace!(
@@ -964,22 +998,7 @@ where
             self.is_low_speed,
         );
 
-        // The DWC2 does not auto-clear CHENA after transfer completion.
-        // If the channel is still active from a previous transfer, we
-        // must explicitly halt it and wait for the hardware to confirm
-        // (CHENA cleared) before reconfiguring. Without this, writing
-        // new HCCHAR/HCTSIZ while the channel is active causes undefined
-        // behavior — typically a permanent hang or stale interrupts.
-        if r.hcchar(ch).read().chena() {
-            r.hcchar(ch).modify(|w| {
-                w.set_chena(true);
-                w.set_chdis(true);
-            });
-            while r.hcchar(ch).read().chena() {
-                core::hint::spin_loop();
-            }
-            r.hcint(ch).write_value(crate::otg_v1::regs::Hcint(0xFFFF_FFFF));
-        }
+        self.prepare_channel();
 
         // Configure channel characteristics
         let is_periodic = matches!(ep_type, EndpointType::Interrupt | EndpointType::Isochronous);
@@ -1042,6 +1061,43 @@ where
         self.state.channels[ch].result.store(0, Ordering::Release);
     }
 
+    /// Stop a previous transfer and recover its PID before starting another request.
+    fn prepare_channel(&mut self) {
+        let r = self.regs;
+        let ch = self.index;
+        // A previous request may have been dropped or forgotten while pending.
+        // Disable its RX storage before halting so the ISR cannot re-arm it.
+        self.clear_rx_buffer();
+
+        // The DWC2 does not auto-clear CHENA after transfer completion.
+        // If the channel is still active from a previous transfer, we
+        // must explicitly halt it and wait for the hardware to confirm
+        // (CHENA cleared) before reconfiguring. Without this, writing
+        // new HCCHAR/HCTSIZ while the channel is active causes undefined
+        // behavior — typically a permanent hang or stale interrupts.
+        if r.hcchar(ch).read().chena() {
+            r.hcchar(ch).modify(|w| {
+                w.set_chena(true);
+                w.set_chdis(true);
+            });
+            while r.hcchar(ch).read().chena() {
+                core::hint::spin_loop();
+            }
+            r.hcint(ch).write_value(crate::otg_v1::regs::Hcint(0xFFFF_FFFF));
+        }
+
+        // CHENA is clear, so the old transfer cannot enqueue more packets.
+        // Drain its queued statuses before configuring this channel again. Other
+        // channels' packets are handled normally, without flushing their FIFO.
+        read_rx_fifo(r, &self.state);
+
+        self.state.mutex.lock(|| unsafe {
+            if let Some(toggle) = (*self.state.channels[ch].rx_next_toggle.get()).take() {
+                self.data_toggle = toggle;
+            }
+        });
+    }
+
     fn enable_channel(&self) {
         let r = self.regs;
         let ch = self.index;
@@ -1051,11 +1107,19 @@ where
         });
     }
 
-    /// Halt and spin until CHENA clears. No-op if already disabled (no CHH would
-    /// be raised, so awaiting one would park forever). Drains any halt CHH.
-    fn halt_channel(&self) {
+    /// Halt and drain a received chunk before finalizing its data and PID count.
+    fn finish_rx(&self) -> u16 {
         let r = self.regs;
         let ch = self.index;
+        let ch_state = &self.state.channels[ch];
+        // Keep accepting packets acknowledged before the halt, but stop the ISR
+        // from scheduling another packet while the hardware is being stopped.
+        self.state.mutex.lock(|| unsafe {
+            *ch_state.rx_rearm.get() = false;
+        });
+
+        // Periodic channels auto-halt after NAK. If already disabled, no CHH
+        // would be raised, so awaiting one would park forever.
         if r.hcchar(ch).read().chena() {
             r.hcchar(ch).modify(|w| {
                 w.set_chena(true);
@@ -1065,8 +1129,15 @@ where
                 core::hint::spin_loop();
             }
         }
-        r.hcint(ch).write_value(crate::otg_v1::regs::Hcint(0xFFFF_FFFF));
-        self.state.channels[ch].result.store(0, Ordering::Release);
+        read_rx_fifo(r, &self.state);
+
+        // Preserve errors arriving during the stop, whether still in hardware
+        // or already published by the ISR, before acknowledging the halt.
+        self.state.mutex.lock(|| {
+            let ints = r.hcint(ch).read();
+            r.hcint(ch).write_value(ints);
+            channel_events(ints) | ch_state.result.swap(0, Ordering::AcqRel)
+        })
     }
 
     fn write_fifo(&self, data: &[u8]) {
@@ -1087,26 +1158,39 @@ where
         }
     }
 
-    fn setup_rx_buffer(&self, buf: &mut [u8]) {
+    fn setup_rx_buffer(&self, capacity: usize, dpid: u8) {
+        assert!(capacity <= RX_BUFFER_SIZE);
         let ch_state = &self.state.channels[self.index];
-        unsafe {
-            *ch_state.rx_buffer.get() = buf.as_mut_ptr();
+        self.state.mutex.lock(|| unsafe {
             *ch_state.rx_count.get() = 0;
-            *ch_state.rx_capacity.get() = buf.len();
-        }
+            *ch_state.rx_capacity.get() = capacity;
+            *ch_state.rx_packets.get() = 0;
+            *ch_state.rx_next_toggle.get() = Some(dpid == vals::Dpid::DATA1.to_bits());
+            *ch_state.rx_active.get() = true;
+            *ch_state.rx_rearm.get() = true;
+        });
     }
 
     fn clear_rx_buffer(&self) {
         let ch_state = &self.state.channels[self.index];
-        unsafe {
-            *ch_state.rx_buffer.get() = core::ptr::null_mut();
+        self.state.mutex.lock(|| unsafe {
+            *ch_state.rx_active.get() = false;
+            *ch_state.rx_rearm.get() = false;
             *ch_state.rx_count.get() = 0;
             *ch_state.rx_capacity.get() = 0;
-        }
+            *ch_state.rx_packets.get() = 0;
+        });
     }
 
-    fn rx_count(&self) -> usize {
-        unsafe { *self.state.channels[self.index].rx_count.get() }
+    fn copy_rx_buffer(&self, buf: &mut [u8]) -> (usize, usize) {
+        let ch_state = &self.state.channels[self.index];
+        self.state.mutex.lock(|| unsafe {
+            let count = *ch_state.rx_count.get();
+            let packets = *ch_state.rx_packets.get();
+            buf[..count].copy_from_slice(&(&*ch_state.rx_buffer.get())[..count]);
+            *ch_state.rx_active.get() = false;
+            (count, packets)
+        })
     }
 
     async fn wait_for_result(&self) -> u16 {
@@ -1199,43 +1283,71 @@ where
     /// time bound; the caller is responsible for cancelling on its own
     /// deadline if one is needed. Disconnect is still surfaced via
     /// [`PipeError::Disconnected`].
-    async fn do_in_transfer(&mut self, ep_type: EndpointType, buf: &mut [u8], dpid: u8) -> Result<usize, PipeError> {
+    async fn do_in_transfer(
+        &mut self,
+        ep_type: EndpointType,
+        buf: &mut [u8],
+        mut dpid: u8,
+    ) -> Result<usize, PipeError> {
         // For interrupt/isochronous endpoints, only request one packet per transfer.
         // The device sends at most one packet per (micro)frame.
         let is_periodic = matches!(ep_type, EndpointType::Interrupt | EndpointType::Isochronous);
-        let xfer_size = if is_periodic {
-            (buf.len() as u32).min(self.max_packet_size as u32)
+        let mps = usize::from(self.max_packet_size);
+        // Every non-final chunk ends on a packet boundary, so staging does not
+        // introduce short packets or change the transfer's termination condition.
+        let chunk_capacity = if is_periodic {
+            mps
         } else {
-            buf.len() as u32
+            // HCTSIZ.PKTCNT is ten bits wide.
+            (RX_BUFFER_SIZE / mps).min(0x3ff) * mps
         };
-        let pktcnt: u16 = if is_periodic {
-            1
-        } else if buf.is_empty() {
-            1
-        } else {
-            ((buf.len() as u32 + self.max_packet_size as u32 - 1) / self.max_packet_size as u32) as u16
-        };
+        let mut transferred = 0;
 
         loop {
-            self.setup_rx_buffer(&mut buf[..xfer_size as usize]);
-            self.configure_channel(true, ep_type, pktcnt, xfer_size, dpid);
+            let xfer_size = (buf.len() - transferred).min(chunk_capacity);
+            let pktcnt = xfer_size.div_ceil(mps).max(1) as u16;
+            self.configure_channel(true, ep_type, pktcnt, xfer_size as u32, dpid);
+            self.setup_rx_buffer(xfer_size, dpid);
             self.enable_channel();
 
-            let events = self.wait_for_result().await;
-            let count = self.rx_count();
-            self.clear_rx_buffer();
-
+            let mut events = self.wait_for_result().await;
+            if !matches!(Self::classify_events(events), ChannelEvent::Error(_)) {
+                events |= self.finish_rx();
+            }
             match Self::classify_events(events) {
-                ChannelEvent::Complete => return Ok(count),
-                ChannelEvent::Nak | ChannelEvent::Nyet | ChannelEvent::Halted | ChannelEvent::None => {
-                    // Periodic channels auto-halt after NAK; settle before retry.
-                    if is_periodic {
-                        self.halt_channel();
+                ChannelEvent::Complete => {
+                    let (count, chunk_packets) = self.copy_rx_buffer(&mut buf[transferred..]);
+                    transferred += count;
+                    if is_periodic || count < xfer_size || transferred == buf.len() {
+                        return Ok(transferred);
                     }
-                    yield_now().await;
-                    continue;
+                    if chunk_packets & 1 != 0 {
+                        dpid ^= 2; // DATA0 and DATA1 differ in bit 1.
+                    }
                 }
-                ChannelEvent::Error(e) => return Err(e),
+                ChannelEvent::Nak | ChannelEvent::Nyet | ChannelEvent::Halted | ChannelEvent::None => {
+                    // A multi-packet transaction may receive data before NAK.
+                    // Keep acknowledged packets and resume with their next PID.
+                    let (count, chunk_packets) = self.copy_rx_buffer(&mut buf[transferred..]);
+                    transferred += count;
+                    if chunk_packets != 0
+                        && (is_periodic
+                            || transferred == buf.len()
+                            || count % mps != 0
+                            || chunk_packets > count.div_ceil(mps))
+                    {
+                        return Ok(transferred);
+                    }
+                    if chunk_packets & 1 != 0 {
+                        dpid ^= 2;
+                    }
+                    self.clear_rx_buffer();
+                    yield_now().await;
+                }
+                ChannelEvent::Error(e) => {
+                    self.clear_rx_buffer();
+                    return Err(e);
+                }
             }
         }
     }
@@ -1343,6 +1455,7 @@ where
     where
         D: pipe::IsIn,
     {
+        self.prepare_channel();
         let dpid = if self.data_toggle {
             vals::Dpid::DATA1
         } else {
@@ -1353,11 +1466,9 @@ where
         // DWC2 toggles DPID internally for every packet in a multi-packet
         // transfer; reflect that in our stored toggle. Zero-byte reads still
         // consume one packet (ZLP).
-        let mps = self.max_packet_size as usize;
-        let packets = if n == 0 { 1 } else { n.div_ceil(mps) };
-        if packets & 1 != 0 {
-            self.data_toggle = !self.data_toggle;
-        }
+        self.state.mutex.lock(|| unsafe {
+            self.data_toggle = (*self.state.channels[self.index].rx_next_toggle.get()).unwrap();
+        });
         Ok(n)
     }
 
@@ -1365,6 +1476,7 @@ where
     where
         D: pipe::IsOut,
     {
+        self.prepare_channel();
         let dpid = if self.data_toggle {
             vals::Dpid::DATA1
         } else {
@@ -1385,6 +1497,7 @@ where
     }
 
     fn reset_data_toggle(&mut self) {
+        self.prepare_channel();
         self.data_toggle = false;
     }
 }
