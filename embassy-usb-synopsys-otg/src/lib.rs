@@ -10,8 +10,11 @@
 // This must go FIRST so that all the other modules see its macros.
 mod fmt;
 
+#[cfg(test)]
+mod tests;
+
 use core::cell::UnsafeCell;
-use core::future::poll_fn;
+use core::future::{Future, poll_fn};
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use core::task::Poll;
@@ -62,11 +65,20 @@ where
 
         assert!(ep_num < ep_count);
 
-        match status.pktstsd() {
+        state.mutex.lock(|| match status.pktstsd() {
             vals::Pktstsd::SETUP_DATA_RX => {
                 trace!("SETUP_DATA_RX");
                 assert!(len == 8, "invalid SETUP packet length={}", len);
                 assert!(ep_num == 0, "invalid SETUP packet endpoint={}", ep_num);
+
+                // RX FIFO entries are ordered: discard only data from before this SETUP.
+                // Data received after it belongs to the new control transfer, even if the
+                // task has not yet consumed the SETUP packet.
+                state.ep_states[0]
+                    .out_size
+                    .store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+                state.cp_state.setup_pending.store(true, Ordering::Release);
+                state.cp_state.setup_ready.store(false, Ordering::Release);
 
                 // flushing TX if something stuck in control endpoint
                 if r.dieptsiz(ep_num).read().pktcnt() != 0 {
@@ -76,6 +88,7 @@ where
                 let data = &state.cp_state.setup_data;
                 data[0].store(r.fifo(0).read().data(), Ordering::Relaxed);
                 data[1].store(r.fifo(0).read().data(), Ordering::Relaxed);
+                state.cp_state.waker.wake();
             }
             vals::Pktstsd::OUT_DATA_RX => {
                 trace!("OUT_DATA_RX ep={} len={}", ep_num, len);
@@ -117,7 +130,7 @@ where
                 trace!("SETUP_DATA_DONE ep={}", ep_num);
             }
             x => trace!("unknown PKTSTS: {}", x.to_bits()),
-        }
+        });
     }
 
     // IN endpoint interrupt
@@ -166,6 +179,7 @@ where
 
                 if ep_ints.stup() {
                     state.cp_state.setup_ready.store(true, Ordering::Release);
+                    state.cp_state.waker.wake();
                 }
                 state.ep_states[ep_num].out_waker.wake();
                 trace!("out ep={} irq val={:08x}", ep_num, ep_ints.0);
@@ -284,8 +298,10 @@ struct EpState {
     out_enabled: AtomicBool,
 }
 
-// SAFETY: `out_buffer` access is synchronized via `out_size`. `in_alloc`/`out_alloc` are written
-// only during endpoint allocation before the USB stack starts; afterward they are read-only.
+// SAFETY: `out_buffer` access is synchronized via `out_size`. EP0 control phases also hold the
+// instance mutex while polling, so a new SETUP cannot release their buffer during a copy.
+// `in_alloc`/`out_alloc` are written only during endpoint allocation before the USB stack starts;
+// afterward they are read-only.
 unsafe impl Send for EpState {}
 unsafe impl Sync for EpState {}
 
@@ -293,6 +309,33 @@ struct ControlPipeSetupState {
     /// Holds received SETUP packets. Available if [Ep0State::setup_ready] is true.
     setup_data: [AtomicU32; 2],
     setup_ready: AtomicBool,
+    // Set as soon as SETUP data arrives, before the SETUP completion interrupt.
+    setup_pending: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl ControlPipeSetupState {
+    async fn until_setup<T>(
+        &self,
+        mutex: impl RawMutex,
+        future: impl Future<Output = Result<T, EndpointError>>,
+    ) -> Result<T, EndpointError> {
+        let mut future = core::pin::pin!(future);
+        poll_fn(|cx| {
+            self.waker.register(cx.waker());
+            // Check cancellation and poll as one operation. In particular, a new SETUP must
+            // not let an old OUT read consume the new transfer's packet, or overwrite a
+            // buffer while that read is copying it. RawMutex permits nested locks.
+            mutex.lock(|| {
+                if self.setup_pending.load(Ordering::Acquire) {
+                    Poll::Ready(Err(EndpointError::Disabled))
+                } else {
+                    future.as_mut().poll(cx)
+                }
+            })
+        })
+        .await
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -437,6 +480,8 @@ where
             cp_state: ControlPipeSetupState {
                 setup_data: [const { AtomicU32::new(0) }; 2],
                 setup_ready: AtomicBool::new(false),
+                setup_pending: AtomicBool::new(false),
+                waker: AtomicWaker::new(),
             },
             ep_states: [const {
                 EpState {
@@ -1146,6 +1191,7 @@ where
         // A packet or a SETUP in these buffers is from the previous session. If the software
         // keeps this data, the stack receives it as data from after the reset.
         st.cp_state.setup_ready.store(false, Ordering::Release);
+        st.cp_state.setup_pending.store(false, Ordering::Release);
         for ep in st.ep_states {
             ep.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
         }
@@ -1896,59 +1942,77 @@ where
 
     async fn setup(&mut self) -> [u8; 8] {
         poll_fn(|cx| {
-            self.ep_out.state.out_waker.register(cx.waker());
+            self.setup_state.waker.register(cx.waker());
 
-            if self.setup_state.setup_ready.load(Ordering::Acquire) {
-                let mut data = [0; 8];
-                data[0..4].copy_from_slice(&self.setup_state.setup_data[0].load(Ordering::Relaxed).to_ne_bytes());
-                data[4..8].copy_from_slice(&self.setup_state.setup_data[1].load(Ordering::Relaxed).to_ne_bytes());
-                self.setup_state.setup_ready.store(false, Ordering::Release);
+            self.mutex.lock(|| {
+                if self.setup_state.setup_ready.load(Ordering::Acquire) {
+                    let mut data = [0; 8];
+                    data[0..4].copy_from_slice(&self.setup_state.setup_data[0].load(Ordering::Relaxed).to_ne_bytes());
+                    data[4..8].copy_from_slice(&self.setup_state.setup_data[1].load(Ordering::Relaxed).to_ne_bytes());
+                    self.setup_state.setup_ready.store(false, Ordering::Release);
+                    self.setup_state.setup_pending.store(false, Ordering::Release);
 
-                // EP0 should not be controlled by `Bus` so this RMW does not need a critical section
-                self.regs.doeptsiz(self.ep_out.info.addr.index()).modify(|w| {
-                    w.set_rxdpid_stupcnt(3);
-                });
+                    self.regs.doeptsiz(self.ep_out.info.addr.index()).modify(|w| {
+                        w.set_rxdpid_stupcnt(3);
+                    });
 
-                // Clear NAK to indicate we are ready to receive more data
-                self.regs
-                    .doepctl(self.ep_out.info.addr.index())
-                    .modify(|w| w.set_cnak(true));
+                    // An abandoned OUT packet may have left EP0 disabled. Rearm it only if
+                    // no packet belonging to this SETUP has already been buffered.
+                    if self.ep_out.state.out_size.load(Ordering::Acquire) == EP_OUT_BUFFER_EMPTY {
+                        self.regs.doeptsiz(self.ep_out.info.addr.index()).modify(|w| {
+                            w.set_xfrsiz(self.max_packet_size as _);
+                            w.set_pktcnt(1);
+                        });
+                        // Clear NAK to indicate we are ready to receive more data.
+                        self.regs.doepctl(self.ep_out.info.addr.index()).modify(|w| {
+                            w.set_epena(true);
+                            w.set_cnak(true);
+                        });
+                    }
 
-                trace!("SETUP received: {:?}", Bytes(&data));
-                Poll::Ready(data)
-            } else {
-                trace!("SETUP waiting");
-                Poll::Pending
-            }
+                    trace!("SETUP received: {:?}", Bytes(&data));
+                    Poll::Ready(data)
+                } else {
+                    trace!("SETUP waiting");
+                    Poll::Pending
+                }
+            })
         })
         .await
     }
 
     async fn data_out(&mut self, buf: &mut [u8], _first: bool, _last: bool) -> Result<usize, EndpointError> {
         trace!("control: data_out");
-        let len = self.ep_out.read(buf).await?;
+        let len = self.setup_state.until_setup(self.mutex, self.ep_out.read(buf)).await?;
         trace!("control: data_out read: {:?}", Bytes(&buf[..len]));
         Ok(len)
     }
 
     async fn data_in(&mut self, data: &[u8], _first: bool, last: bool) -> Result<(), EndpointError> {
         trace!("control: data_in write: {:?}", Bytes(data));
-        self.ep_in.write(data).await?;
+        self.setup_state
+            .until_setup(self.mutex, async {
+                self.ep_in.write(data).await?;
 
-        // wait for status response from host after sending the last packet
-        if last {
-            trace!("control: data_in waiting for status");
-            self.ep_out.read(&mut []).await?;
-            trace!("control: complete");
-        }
+                // wait for status response from host after sending the last packet
+                if last {
+                    trace!("control: data_in waiting for status");
+                    self.ep_out.read(&mut []).await?;
+                    trace!("control: complete");
+                }
 
-        Ok(())
+                Ok(())
+            })
+            .await
     }
 
     async fn accept(&mut self) {
         trace!("control: accept");
 
-        self.ep_in.write(&[]).await.ok();
+        self.setup_state
+            .until_setup(self.mutex, self.ep_in.write(&[]))
+            .await
+            .ok();
 
         trace!("control: accept OK");
     }
@@ -1956,25 +2020,32 @@ where
     async fn reject(&mut self) {
         trace!("control: reject");
 
-        // EP0 should not be controlled by `Bus` so this RMW does not need a critical section
-        self.regs.diepctl(self.ep_in.info.addr.index()).modify(|w| {
-            w.set_stall(true);
-        });
-        self.regs.doepctl(self.ep_out.info.addr.index()).modify(|w| {
-            w.set_stall(true);
+        self.mutex.lock(|| {
+            if self.setup_state.setup_pending.load(Ordering::Acquire) {
+                return;
+            }
+            self.regs.diepctl(self.ep_in.info.addr.index()).modify(|w| {
+                w.set_stall(true);
+            });
+            self.regs.doepctl(self.ep_out.info.addr.index()).modify(|w| {
+                w.set_stall(true);
+            });
         });
     }
 
     async fn accept_set_address(&mut self, addr: u8) {
         trace!("setting addr: {}", addr);
-        self.mutex.lock(|| {
-            self.regs.dcfg().modify(|w| {
-                w.set_dad(addr);
-            });
-        });
+        self.setup_state
+            .until_setup(self.mutex, async {
+                self.regs.dcfg().modify(|w| {
+                    w.set_dad(addr);
+                });
 
-        // synopsys driver requires accept to be sent after changing address
-        self.accept().await
+                // synopsys driver requires accept to be sent after changing address
+                self.ep_in.write(&[]).await
+            })
+            .await
+            .ok();
     }
 }
 
