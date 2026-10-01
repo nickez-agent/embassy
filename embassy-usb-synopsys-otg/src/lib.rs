@@ -10,6 +10,9 @@
 // This must go FIRST so that all the other modules see its macros.
 mod fmt;
 
+#[cfg(test)]
+mod tests;
+
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
@@ -53,72 +56,7 @@ where
         state.bus_waker.wake();
     }
 
-    // Handle RX
-    while r.gintsts().read().rxflvl() {
-        let status = r.grxstsp().read();
-        trace!("=== status {:08x}", status.0);
-        let ep_num = status.epnum() as usize;
-        let len = status.bcnt() as usize;
-
-        assert!(ep_num < ep_count);
-
-        match status.pktstsd() {
-            vals::Pktstsd::SETUP_DATA_RX => {
-                trace!("SETUP_DATA_RX");
-                assert!(len == 8, "invalid SETUP packet length={}", len);
-                assert!(ep_num == 0, "invalid SETUP packet endpoint={}", ep_num);
-
-                // flushing TX if something stuck in control endpoint
-                if r.dieptsiz(ep_num).read().pktcnt() != 0 {
-                    flush_tx_fifo(r, ep_num as _);
-                }
-
-                let data = &state.cp_state.setup_data;
-                data[0].store(r.fifo(0).read().data(), Ordering::Relaxed);
-                data[1].store(r.fifo(0).read().data(), Ordering::Relaxed);
-            }
-            vals::Pktstsd::OUT_DATA_RX => {
-                trace!("OUT_DATA_RX ep={} len={}", ep_num, len);
-
-                if state.ep_states[ep_num].out_size.load(Ordering::Acquire) == EP_OUT_BUFFER_EMPTY {
-                    // SAFETY: Buffer size is allocated to be equal to endpoint's maximum packet size
-                    // We trust the peripheral to not exceed its configured MPSIZ
-                    let buf =
-                        unsafe { core::slice::from_raw_parts_mut(*state.ep_states[ep_num].out_buffer.get(), len) };
-
-                    let mut chunks = buf.chunks_exact_mut(4);
-                    for chunk in &mut chunks {
-                        // RX FIFO is shared so always read from fifo(0)
-                        let data = r.fifo(0).read().0;
-                        chunk.copy_from_slice(&data.to_ne_bytes());
-                    }
-                    let rem = chunks.into_remainder();
-                    if !rem.is_empty() {
-                        let data = r.fifo(0).read().0;
-                        rem.copy_from_slice(&data.to_ne_bytes()[0..rem.len()]);
-                    }
-
-                    state.ep_states[ep_num].out_size.store(len as u16, Ordering::Release);
-                    state.ep_states[ep_num].out_waker.wake();
-                } else {
-                    error!("ep_out buffer overflow index={}", ep_num);
-
-                    // discard FIFO data
-                    let len_words = (len + 3) / 4;
-                    for _ in 0..len_words {
-                        r.fifo(0).read().data();
-                    }
-                }
-            }
-            vals::Pktstsd::OUT_DATA_DONE => {
-                trace!("OUT_DATA_DONE ep={}", ep_num);
-            }
-            vals::Pktstsd::SETUP_DATA_DONE => {
-                trace!("SETUP_DATA_DONE ep={}", ep_num);
-            }
-            x => trace!("unknown PKTSTS: {}", x.to_bits()),
-        }
-    }
+    state.mutex.lock(|| read_rx_fifo(r, state));
 
     // IN endpoint interrupt
     if ints.iepint() {
@@ -220,6 +158,81 @@ where
     }
 }
 
+// Drain the shared RX FIFO without discarding packets belonging to other endpoints.
+// The caller must hold the state mutex to exclude concurrent FIFO access.
+fn read_rx_fifo<M>(r: Otg, state: &State<'_, M>)
+where
+    M: RawMutex + Copy,
+{
+    let ep_count = state.endpoint_count();
+    // Handle RX
+    while r.gintsts().read().rxflvl() {
+        let status = r.grxstsp().read();
+        trace!("=== status {:08x}", status.0);
+        let ep_num = status.epnum() as usize;
+        let len = status.bcnt() as usize;
+
+        assert!(ep_num < ep_count);
+
+        match status.pktstsd() {
+            vals::Pktstsd::SETUP_DATA_RX => {
+                trace!("SETUP_DATA_RX");
+                assert!(len == 8, "invalid SETUP packet length={}", len);
+                assert!(ep_num == 0, "invalid SETUP packet endpoint={}", ep_num);
+
+                // flushing TX if something stuck in control endpoint
+                if r.dieptsiz(ep_num).read().pktcnt() != 0 {
+                    flush_tx_fifo(r, ep_num as _);
+                }
+
+                let data = &state.cp_state.setup_data;
+                data[0].store(r.fifo(0).read().data(), Ordering::Relaxed);
+                data[1].store(r.fifo(0).read().data(), Ordering::Relaxed);
+            }
+            vals::Pktstsd::OUT_DATA_RX => {
+                trace!("OUT_DATA_RX ep={} len={}", ep_num, len);
+
+                if state.ep_states[ep_num].out_size.load(Ordering::Acquire) == EP_OUT_BUFFER_EMPTY {
+                    // SAFETY: Buffer size is allocated to be equal to endpoint's maximum packet size
+                    // We trust the peripheral to not exceed its configured MPSIZ
+                    let buf =
+                        unsafe { core::slice::from_raw_parts_mut(*state.ep_states[ep_num].out_buffer.get(), len) };
+
+                    let mut chunks = buf.chunks_exact_mut(4);
+                    for chunk in &mut chunks {
+                        // RX FIFO is shared so always read from fifo(0)
+                        let data = r.fifo(0).read().0;
+                        chunk.copy_from_slice(&data.to_ne_bytes());
+                    }
+                    let rem = chunks.into_remainder();
+                    if !rem.is_empty() {
+                        let data = r.fifo(0).read().0;
+                        rem.copy_from_slice(&data.to_ne_bytes()[0..rem.len()]);
+                    }
+
+                    state.ep_states[ep_num].out_size.store(len as u16, Ordering::Release);
+                    state.ep_states[ep_num].out_waker.wake();
+                } else {
+                    error!("ep_out buffer overflow index={}", ep_num);
+
+                    // discard FIFO data
+                    let len_words = (len + 3) / 4;
+                    for _ in 0..len_words {
+                        r.fifo(0).read().data();
+                    }
+                }
+            }
+            vals::Pktstsd::OUT_DATA_DONE => {
+                trace!("OUT_DATA_DONE ep={}", ep_num);
+            }
+            vals::Pktstsd::SETUP_DATA_DONE => {
+                trace!("SETUP_DATA_DONE ep={}", ep_num);
+            }
+            x => trace!("unknown PKTSTS: {}", x.to_bits()),
+        }
+    }
+}
+
 /// USB PHY type
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum PhyType {
@@ -284,8 +297,10 @@ struct EpState {
     out_enabled: AtomicBool,
 }
 
-// SAFETY: `out_buffer` access is synchronized via `out_size`. `in_alloc`/`out_alloc` are written
-// only during endpoint allocation before the USB stack starts; afterward they are read-only.
+// SAFETY: `out_buffer` access is synchronized via `out_size`. Reads and discards also hold
+// the state mutex, so discarding a packet cannot release a buffer that is still being read.
+// `in_alloc`/`out_alloc` are written only during endpoint allocation before the USB stack
+// starts; afterward they are read-only.
 unsafe impl Send for EpState {}
 unsafe impl Sync for EpState {}
 
@@ -1145,10 +1160,12 @@ where
         // Discard the data that the device received before the reset. The FIFOs are empty now.
         // A packet or a SETUP in these buffers is from the previous session. If the software
         // keeps this data, the stack receives it as data from after the reset.
-        st.cp_state.setup_ready.store(false, Ordering::Release);
-        for ep in st.ep_states {
-            ep.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
-        }
+        st.mutex.lock(|| {
+            st.cp_state.setup_ready.store(false, Ordering::Release);
+            for ep in st.ep_states {
+                ep.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+            }
+        });
 
         // Configure IN endpoints
         for index in 0..st.endpoint_count() {
@@ -1486,14 +1503,33 @@ where
 
         match ep_addr.direction() {
             Direction::Out => {
+                let index = ep_addr.index();
+                let ep_state = &st.ep_states[index];
+
+                // Stop readers from consuming or rearming the endpoint during reconfiguration.
+                st.mutex.lock(|| ep_state.out_enabled.store(false, Ordering::Release));
+
                 // Cancel a transfer that is active. This step is not in the critical section
                 // below, because the interrupt handler must run for the global OUT NAK to
                 // become effective. Refer to [`abort_out_endpoint`].
-                if !enabled && regs.doepctl(ep_addr.index()).read().epena() {
-                    abort_out_endpoint(regs, ep_addr.index());
+                // Enabling an already-enabled endpoint also starts a new configuration or
+                // alternate setting, so its previous transfer must be stopped too.
+                if regs.doepctl(index).read().epena() {
+                    abort_out_endpoint(regs, index);
+                    if regs.doepctl(index).read().epena() {
+                        // A timed-out stop must not expose old packets to a new configuration.
+                        ep_state.out_waker.wake();
+                        return;
+                    }
                 }
 
                 st.mutex.lock(|| {
+                    // EPENA is clear, but a completed packet can still be in the shared RX
+                    // FIFO. Drain it before discarding this endpoint's software buffer. Other
+                    // endpoints retain their packets, and readers cannot race this discard.
+                    read_rx_fifo(regs, &st);
+                    ep_state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+
                     regs.doepctl(ep_addr.index()).modify(|w| {
                         w.set_usbaep(enabled);
                         // A change of the configuration or of the alternate setting sets the
@@ -1517,13 +1553,12 @@ where
                             });
                         }
                     }
+
+                    ep_state.out_enabled.store(enabled, Ordering::Release);
                 });
 
-                st.ep_states[ep_addr.index()]
-                    .out_enabled
-                    .store(enabled, Ordering::Release);
                 // Wake `Endpoint::wait_enabled()`
-                st.ep_states[ep_addr.index()].out_waker.wake();
+                ep_state.out_waker.wake();
             }
             Direction::In => {
                 st.mutex.lock(|| {
@@ -1694,27 +1729,28 @@ where
             let index = self.info.addr.index();
             self.state.out_waker.register(cx.waker());
 
-            if !self.state.out_enabled.load(Ordering::Acquire) {
-                trace!("read ep={:?} error disabled", self.info.addr);
-                return Poll::Ready(Err(EndpointError::Disabled));
-            }
-
-            let len = self.state.out_size.load(Ordering::Acquire);
-            if len != EP_OUT_BUFFER_EMPTY {
-                trace!("read ep={:?} done len={}", self.info.addr, len);
-
-                if len as usize > buf.len() {
-                    return Poll::Ready(Err(EndpointError::BufferOverflow));
+            self.mutex.lock(|| {
+                if !self.state.out_enabled.load(Ordering::Acquire) {
+                    trace!("read ep={:?} error disabled", self.info.addr);
+                    return Poll::Ready(Err(EndpointError::Disabled));
                 }
 
-                // SAFETY: exclusive access ensured by `out_size` atomic variable
-                let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
-                buf[..len as usize].copy_from_slice(data);
+                let len = self.state.out_size.load(Ordering::Acquire);
+                if len != EP_OUT_BUFFER_EMPTY {
+                    trace!("read ep={:?} done len={}", self.info.addr, len);
 
-                // Release buffer
-                self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+                    if len as usize > buf.len() {
+                        return Poll::Ready(Err(EndpointError::BufferOverflow));
+                    }
 
-                self.mutex.lock(|| {
+                    // SAFETY: `out_size` excludes the ISR writer, and the mutex prevents a
+                    // concurrent discard from releasing this buffer while it is being copied.
+                    let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
+                    buf[..len as usize].copy_from_slice(data);
+
+                    // Release buffer
+                    self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+
                     // Receive 1 packet
                     self.regs.doeptsiz(index).modify(|w| {
                         w.set_xfrsiz(self.info.max_packet_size as _);
@@ -1743,12 +1779,12 @@ where
                         w.set_epena(true);
                         w.set_cnak(true);
                     });
-                });
 
-                Poll::Ready(Ok(len as usize))
-            } else {
-                Poll::Pending
-            }
+                    Poll::Ready(Ok(len as usize))
+                } else {
+                    Poll::Pending
+                }
+            })
         })
         .await
     }
