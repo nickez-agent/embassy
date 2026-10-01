@@ -17,8 +17,7 @@
 //!   This is due to regex spaghetti: <https://android.googlesource.com/platform/frameworks/base/+/refs/tags/android-mainline-12.0.0_r84/core/res/res/values/config.xml#417>
 //!   and this nonsense in the linux kernel: <https://github.com/torvalds/linux/blob/c00c5e1d157bec0ef0b0b59aa5482eb8dc7e8e49/drivers/net/usb/usbnet.c#L1751-L1757>
 
-use core::mem::{MaybeUninit, size_of};
-use core::ptr::{addr_of, copy_nonoverlapping};
+use core::mem::MaybeUninit;
 
 use crate::control::{self, InResponse, OutResponse, Recipient, Request, RequestType};
 use crate::driver::{Driver, Endpoint, EndpointError, EndpointIn, EndpointOut};
@@ -77,8 +76,6 @@ const ALTERNATE_SETTING_DISABLED: u8 = 0x00;
 const ALTERNATE_SETTING_ENABLED: u8 = 0x01;
 
 /// Simple NTB header (NTH+NDP all in one) for sending packets
-#[repr(C, packed)]
-#[allow(unused)]
 struct NtbOutHeader {
     // NTH
     nth_sig: u32,
@@ -97,8 +94,27 @@ struct NtbOutHeader {
     ndp_term2: u16,
 }
 
-#[repr(C, packed)]
-#[allow(unused)]
+impl NtbOutHeader {
+    const LEN: usize = 28;
+
+    fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut buf = [0; Self::LEN];
+        buf[0..4].copy_from_slice(&self.nth_sig.to_le_bytes());
+        buf[4..6].copy_from_slice(&self.nth_len.to_le_bytes());
+        buf[6..8].copy_from_slice(&self.nth_seq.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.nth_total_len.to_le_bytes());
+        buf[10..12].copy_from_slice(&self.nth_first_index.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.ndp_sig.to_le_bytes());
+        buf[16..18].copy_from_slice(&self.ndp_len.to_le_bytes());
+        buf[18..20].copy_from_slice(&self.ndp_next_index.to_le_bytes());
+        buf[20..22].copy_from_slice(&self.ndp_datagram_index.to_le_bytes());
+        buf[22..24].copy_from_slice(&self.ndp_datagram_len.to_le_bytes());
+        buf[24..26].copy_from_slice(&self.ndp_term1.to_le_bytes());
+        buf[26..28].copy_from_slice(&self.ndp_term2.to_le_bytes());
+        buf
+    }
+}
+
 struct NtbParameters {
     length: u16,
     formats_supported: u16,
@@ -106,8 +122,19 @@ struct NtbParameters {
     out_params: NtbParametersDir,
 }
 
-#[repr(C, packed)]
-#[allow(unused)]
+impl NtbParameters {
+    const LEN: usize = 28;
+
+    fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut buf = [0; Self::LEN];
+        buf[0..2].copy_from_slice(&self.length.to_le_bytes());
+        buf[2..4].copy_from_slice(&self.formats_supported.to_le_bytes());
+        buf[4..16].copy_from_slice(&self.in_params.to_bytes());
+        buf[16..28].copy_from_slice(&self.out_params.to_bytes());
+        buf
+    }
+}
+
 struct NtbParametersDir {
     max_size: u32,
     divisor: u16,
@@ -116,10 +143,16 @@ struct NtbParametersDir {
     max_datagram_count: u16,
 }
 
-fn byteify<T>(buf: &mut [u8], data: T) -> &[u8] {
-    let len = size_of::<T>();
-    unsafe { copy_nonoverlapping(addr_of!(data).cast(), buf.as_mut_ptr(), len) }
-    &buf[..len]
+impl NtbParametersDir {
+    fn to_bytes(&self) -> [u8; 12] {
+        let mut buf = [0; 12];
+        buf[0..4].copy_from_slice(&self.max_size.to_le_bytes());
+        buf[4..6].copy_from_slice(&self.divisor.to_le_bytes());
+        buf[6..8].copy_from_slice(&self.payload_remainder.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.out_alignment.to_le_bytes());
+        buf[10..12].copy_from_slice(&self.max_datagram_count.to_le_bytes());
+        buf
+    }
 }
 
 /// Internal state for the CDC-NCM class.
@@ -210,8 +243,11 @@ impl<'d> Handler for Control<'d> {
 
         match req.request {
             REQ_GET_NTB_PARAMETERS => {
+                let Some(buf) = buf.get_mut(..NtbParameters::LEN) else {
+                    return Some(InResponse::Rejected);
+                };
                 let res = NtbParameters {
-                    length: size_of::<NtbParameters>() as _,
+                    length: NtbParameters::LEN as _,
                     formats_supported: 1, // only 16bit,
                     in_params: NtbParametersDir {
                         max_size: NTB_MAX_SIZE as _,
@@ -228,7 +264,8 @@ impl<'d> Handler for Control<'d> {
                         max_datagram_count: 1, // We only decode 1 packet per NTB
                     },
                 };
-                Some(InResponse::Accepted(byteify(buf, res)))
+                buf.copy_from_slice(&res.to_bytes());
+                Some(InResponse::Accepted(buf))
             }
             _ => Some(InResponse::Rejected),
         }
@@ -394,7 +431,7 @@ impl<'d, D: Driver<'d>> Sender<'d, D> {
     ///
     /// This waits until the packet is successfully stored in the CDC-NCM endpoint buffers.
     pub async fn write_packet(&mut self, data: &[u8]) -> Result<(), EndpointError> {
-        const OUT_HEADER_LEN: usize = 28;
+        const OUT_HEADER_LEN: usize = NtbOutHeader::LEN;
         const ABS_MAX_PACKET_SIZE: usize = 512;
 
         let seq = self.seq;
@@ -418,8 +455,7 @@ impl<'d, D: Driver<'d>> Sender<'d, D> {
 
         // Build first packet on a buffer, send next packets straight from `data`.
         let mut buf = [0; ABS_MAX_PACKET_SIZE];
-        let n = byteify(&mut buf, header);
-        assert_eq!(n.len(), OUT_HEADER_LEN);
+        buf[..OUT_HEADER_LEN].copy_from_slice(&header.to_bytes());
 
         if OUT_HEADER_LEN + data.len() < self.max_packet_size {
             // First packet is not full, just send it.
@@ -526,5 +562,89 @@ impl<'d, D: Driver<'d>> Receiver<'d, D> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GET_NTB_PARAMETERS: Request = Request {
+        direction: crate::driver::Direction::In,
+        request_type: RequestType::Class,
+        recipient: Recipient::Interface,
+        request: REQ_GET_NTB_PARAMETERS,
+        value: 0,
+        index: 0,
+        length: 28,
+    };
+
+    fn control(shared: &ControlShared) -> Control<'_> {
+        Control {
+            mac_addr_string: StringIndex(4),
+            shared,
+            mac_addr_str: [0; 12],
+            comm_if: InterfaceNumber(0),
+            data_if: InterfaceNumber(1),
+        }
+    }
+
+    #[test]
+    fn test_get_ntb_parameters_short_buffer() {
+        let shared = ControlShared::default();
+        let mut control = control(&shared);
+        for len in 0..28 {
+            let mut buf = [0xa5; 32];
+            assert_eq!(
+                control.control_in(GET_NTB_PARAMETERS, &mut buf[..len]),
+                Some(InResponse::Rejected)
+            );
+            assert_eq!(buf, [0xa5; 32]);
+        }
+    }
+
+    #[test]
+    fn test_get_ntb_parameters_exact_and_larger_buffer() {
+        let shared = ControlShared::default();
+        let mut control = control(&shared);
+        let expected = [
+            28, 0, // length
+            1, 0, // 16-bit NTB format
+            0, 8, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, // IN parameters
+            0, 8, 0, 0, 4, 0, 0, 0, 4, 0, 1, 0, // OUT parameters
+        ];
+        for len in 28..=32 {
+            let mut buf = [0xa5; 32];
+            assert_eq!(
+                control.control_in(GET_NTB_PARAMETERS, &mut buf[..len]),
+                Some(InResponse::Accepted(&expected))
+            );
+            assert_eq!(&buf[28..], &[0xa5; 4]);
+        }
+    }
+
+    #[test]
+    fn test_ntb_out_header_to_bytes() {
+        let header = NtbOutHeader {
+            nth_sig: SIG_NTH,
+            nth_len: 0x0c,
+            nth_seq: 0x1234,
+            nth_total_len: 0x0594,
+            nth_first_index: 0x0c,
+            ndp_sig: SIG_NDP_NO_FCS,
+            ndp_len: 0x10,
+            ndp_next_index: 0,
+            ndp_datagram_index: 28,
+            ndp_datagram_len: 0x0578,
+            ndp_term1: 0,
+            ndp_term2: 0,
+        };
+        assert_eq!(
+            header.to_bytes(),
+            [
+                0x4e, 0x43, 0x4d, 0x48, 0x0c, 0, 0x34, 0x12, 0x94, 0x05, 0x0c, 0, // NTH
+                0x4e, 0x43, 0x4d, 0x30, 0x10, 0, 0, 0, 0x1c, 0, 0x78, 0x05, 0, 0, 0, 0, // NDP
+            ]
+        );
     }
 }
