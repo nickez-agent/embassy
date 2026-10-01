@@ -10,6 +10,9 @@
 // This must go FIRST so that all the other modules see its macros.
 mod fmt;
 
+#[cfg(test)]
+mod tests;
+
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
@@ -54,71 +57,82 @@ where
     }
 
     // Handle RX
-    while r.gintsts().read().rxflvl() {
-        let status = r.grxstsp().read();
-        trace!("=== status {:08x}", status.0);
-        let ep_num = status.epnum() as usize;
-        let len = status.bcnt() as usize;
+    state.mutex.lock(|| {
+        while r.gintsts().read().rxflvl() {
+            let status = r.grxstsp().read();
+            trace!("=== status {:08x}", status.0);
+            let ep_num = status.epnum() as usize;
+            let len = status.bcnt() as usize;
 
-        assert!(ep_num < ep_count);
+            assert!(ep_num < ep_count);
 
-        match status.pktstsd() {
-            vals::Pktstsd::SETUP_DATA_RX => {
-                trace!("SETUP_DATA_RX");
-                assert!(len == 8, "invalid SETUP packet length={}", len);
-                assert!(ep_num == 0, "invalid SETUP packet endpoint={}", ep_num);
+            match status.pktstsd() {
+                vals::Pktstsd::SETUP_DATA_RX => {
+                    trace!("SETUP_DATA_RX");
+                    assert!(len == 8, "invalid SETUP packet length={}", len);
+                    assert!(ep_num == 0, "invalid SETUP packet endpoint={}", ep_num);
 
-                // flushing TX if something stuck in control endpoint
-                if r.dieptsiz(ep_num).read().pktcnt() != 0 {
-                    flush_tx_fifo(r, ep_num as _);
+                    // flushing TX if something stuck in control endpoint
+                    if r.dieptsiz(ep_num).read().pktcnt() != 0 && !flush_tx_fifo(r, ep_num as _) {
+                        // Keep draining the SETUP words, but leave the control pipe
+                        // unavailable until reset restores a known FIFO state.
+                        r.diepctl(ep_num).modify(|w| w.set_snak(true));
+                        state.ep_states[ep_num].in_enabled.store(false, Ordering::Release);
+                        state.ep_states[ep_num].out_enabled.store(false, Ordering::Release);
+                        state.cp_state.setup_ready.store(false, Ordering::Release);
+                        state.ep_states[ep_num].in_waker.wake();
+                        state.ep_states[ep_num].out_waker.wake();
+                    }
+
+                    let data = &state.cp_state.setup_data;
+                    data[0].store(r.fifo(0).read().data(), Ordering::Relaxed);
+                    data[1].store(r.fifo(0).read().data(), Ordering::Relaxed);
                 }
+                vals::Pktstsd::OUT_DATA_RX => {
+                    trace!("OUT_DATA_RX ep={} len={}", ep_num, len);
 
-                let data = &state.cp_state.setup_data;
-                data[0].store(r.fifo(0).read().data(), Ordering::Relaxed);
-                data[1].store(r.fifo(0).read().data(), Ordering::Relaxed);
-            }
-            vals::Pktstsd::OUT_DATA_RX => {
-                trace!("OUT_DATA_RX ep={} len={}", ep_num, len);
+                    if state.ep_states[ep_num].out_enabled.load(Ordering::Acquire)
+                        && state.ep_states[ep_num].out_size.load(Ordering::Acquire) == EP_OUT_BUFFER_EMPTY
+                    {
+                        // SAFETY: Buffer size is allocated to be equal to endpoint's maximum packet size
+                        // We trust the peripheral to not exceed its configured MPSIZ
+                        let buf =
+                            unsafe { core::slice::from_raw_parts_mut(*state.ep_states[ep_num].out_buffer.get(), len) };
 
-                if state.ep_states[ep_num].out_size.load(Ordering::Acquire) == EP_OUT_BUFFER_EMPTY {
-                    // SAFETY: Buffer size is allocated to be equal to endpoint's maximum packet size
-                    // We trust the peripheral to not exceed its configured MPSIZ
-                    let buf =
-                        unsafe { core::slice::from_raw_parts_mut(*state.ep_states[ep_num].out_buffer.get(), len) };
+                        let mut chunks = buf.chunks_exact_mut(4);
+                        for chunk in &mut chunks {
+                            // RX FIFO is shared so always read from fifo(0)
+                            let data = r.fifo(0).read().0;
+                            chunk.copy_from_slice(&data.to_ne_bytes());
+                        }
+                        let rem = chunks.into_remainder();
+                        if !rem.is_empty() {
+                            let data = r.fifo(0).read().0;
+                            rem.copy_from_slice(&data.to_ne_bytes()[0..rem.len()]);
+                        }
 
-                    let mut chunks = buf.chunks_exact_mut(4);
-                    for chunk in &mut chunks {
-                        // RX FIFO is shared so always read from fifo(0)
-                        let data = r.fifo(0).read().0;
-                        chunk.copy_from_slice(&data.to_ne_bytes());
-                    }
-                    let rem = chunks.into_remainder();
-                    if !rem.is_empty() {
-                        let data = r.fifo(0).read().0;
-                        rem.copy_from_slice(&data.to_ne_bytes()[0..rem.len()]);
-                    }
+                        state.ep_states[ep_num].out_size.store(len as u16, Ordering::Release);
+                        state.ep_states[ep_num].out_waker.wake();
+                    } else {
+                        error!("ep_out buffer overflow index={}", ep_num);
 
-                    state.ep_states[ep_num].out_size.store(len as u16, Ordering::Release);
-                    state.ep_states[ep_num].out_waker.wake();
-                } else {
-                    error!("ep_out buffer overflow index={}", ep_num);
-
-                    // discard FIFO data
-                    let len_words = (len + 3) / 4;
-                    for _ in 0..len_words {
-                        r.fifo(0).read().data();
+                        // discard FIFO data
+                        let len_words = (len + 3) / 4;
+                        for _ in 0..len_words {
+                            r.fifo(0).read().data();
+                        }
                     }
                 }
+                vals::Pktstsd::OUT_DATA_DONE => {
+                    trace!("OUT_DATA_DONE ep={}", ep_num);
+                }
+                vals::Pktstsd::SETUP_DATA_DONE => {
+                    trace!("SETUP_DATA_DONE ep={}", ep_num);
+                }
+                x => trace!("unknown PKTSTS: {}", x.to_bits()),
             }
-            vals::Pktstsd::OUT_DATA_DONE => {
-                trace!("OUT_DATA_DONE ep={}", ep_num);
-            }
-            vals::Pktstsd::SETUP_DATA_DONE => {
-                trace!("SETUP_DATA_DONE ep={}", ep_num);
-            }
-            x => trace!("unknown PKTSTS: {}", x.to_bits()),
         }
-    }
+    });
 
     // IN endpoint interrupt
     if ints.iepint() {
@@ -164,9 +178,14 @@ where
                 // clear all
                 r.doepint(ep_num).write_value(ep_ints);
 
-                if ep_ints.stup() {
-                    state.cp_state.setup_ready.store(true, Ordering::Release);
-                }
+                state.mutex.lock(|| {
+                    if ep_ints.stup()
+                        && state.ep_states[ep_num].in_enabled.load(Ordering::Acquire)
+                        && state.ep_states[ep_num].out_enabled.load(Ordering::Acquire)
+                    {
+                        state.cp_state.setup_ready.store(true, Ordering::Release);
+                    }
+                });
                 state.ep_states[ep_num].out_waker.wake();
                 trace!("out ep={} irq val={:08x}", ep_num, ep_ints.0);
             }
@@ -200,7 +219,12 @@ where
 
             // Set NAK and disable the endpoint. Do not flush the transmit FIFO: the packet in
             // that FIFO is the packet that this function sends again in the next frame.
-            abort_in_endpoint(r, ep_num);
+            if !abort_in_endpoint(r, ep_num) {
+                ep_diepctl.modify(|w| w.set_usbaep(false));
+                state.ep_states[ep_num].in_enabled.store(false, Ordering::Release);
+                state.ep_states[ep_num].in_waker.wake();
+                continue;
+            }
 
             // Switch the packet polarity
             ep_diepctl.modify(|r| {
@@ -284,7 +308,8 @@ struct EpState {
     out_enabled: AtomicBool,
 }
 
-// SAFETY: `out_buffer` access is synchronized via `out_size`. `in_alloc`/`out_alloc` are written
+// SAFETY: RX buffer access and reset are protected by the shared state mutex; `out_size` publishes
+// packet availability. `in_alloc`/`out_alloc` are written
 // only during endpoint allocation before the USB stack starts; afterward they are read-only.
 unsafe impl Send for EpState {}
 unsafe impl Sync for EpState {}
@@ -746,18 +771,34 @@ where
 #[cfg(feature = "embassy-time")]
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(10);
 
+/// Maximum condition evaluations for one core handshake, even if the clock is stopped.
+///
+/// Ten million polls leave a generous margin for the one or two USB frames needed
+/// by a working core. This is deliberately not a calibrated delay: its duration
+/// depends on the CPU, register bus, and optimization level. The optional timer
+/// deadline normally expires first; this budget also bounds waits made with
+/// timer interrupts masked or without an `embassy-time` driver.
+const HANDSHAKE_POLL_LIMIT: usize = 10_000_000;
+
 /// The TXFNUM value that selects all the transmit FIFOs.
 const TX_FIFO_ALL: u8 = 0x10;
 
-/// Waits until `cond` is true.
+/// Waits until `cond` is true, with at most [`HANDSHAKE_POLL_LIMIT`] evaluations.
 ///
-/// Returns false if `cond` does not become true before [`HANDSHAKE_TIMEOUT`].
-///
-/// Loops indefinitely without `embassy-time`.
-fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+/// With `embassy-time`, also returns false after the ten-millisecond deadline.
+/// The polling budget remains in effect if the timer cannot advance, including
+/// inside a critical section. Without a running clock this is a finite work
+/// limit, not a wall-clock timeout.
+fn wait_for(cond: impl FnMut() -> bool) -> bool {
+    wait_for_with_limit(cond, HANDSHAKE_POLL_LIMIT)
+}
+
+fn wait_for_with_limit(mut cond: impl FnMut() -> bool, poll_limit: usize) -> bool {
     #[cfg(feature = "embassy-time")]
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    loop {
+    for _ in 0..poll_limit {
+        #[cfg(test)]
+        tests::handshake_poll();
         if cond() {
             return true;
         }
@@ -766,26 +807,34 @@ fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
         if Instant::now() >= deadline {
             return false;
         }
+        core::hint::spin_loop();
     }
+    false
 }
 
 /// Flushes one transmit FIFO, or all of them if `txfnum` is [`TX_FIFO_ALL`].
-fn flush_tx_fifo(regs: Otg, txfnum: u8) {
+/// Returns false if the core does not confirm the flush.
+fn flush_tx_fifo(regs: Otg, txfnum: u8) -> bool {
     regs.grstctl().write(|w| {
         w.set_txfflsh(true);
         w.set_txfnum(txfnum);
     });
     if !wait_for(|| !regs.grstctl().read().txfflsh()) {
         warn!("timeout during the flush of tx fifo {}", txfnum);
+        return false;
     }
+    true
 }
 
 /// Flushes the receive FIFO. All the OUT endpoints share this FIFO.
-fn flush_rx_fifo(regs: Otg) {
+/// Returns false if the core does not confirm the flush.
+fn flush_rx_fifo(regs: Otg) -> bool {
     regs.grstctl().write(|w| w.set_rxfflsh(true));
     if !wait_for(|| !regs.grstctl().read().rxfflsh()) {
         warn!("timeout during the flush of the rx fifo");
+        return false;
     }
+    true
 }
 
 /// Stops a transfer that is in progress on an IN endpoint.
@@ -796,29 +845,38 @@ fn flush_rx_fifo(regs: Otg) {
 ///
 /// The transmit FIFO of the endpoint keeps the data of the stopped transfer. The caller must
 /// flush that FIFO if the data is no longer necessary.
-fn abort_in_endpoint(regs: Otg, index: usize) {
+/// Returns false if the endpoint could not be stopped; its FIFO must not be flushed or reused.
+fn abort_in_endpoint(regs: Otg, index: usize) -> bool {
     let ctl = regs.diepctl(index);
     let int = regs.diepint(index);
 
     ctl.modify(|w| w.set_snak(true));
-    if !wait_for(|| int.read().inepne()) {
+    if !wait_for(|| int.read().inepne() || !ctl.read().epena()) {
         warn!("timeout during the wait for inepne on in ep={}", index);
+        return false;
+    }
+    if !ctl.read().epena() {
+        return true;
     }
 
     ctl.modify(|w| {
         w.set_snak(true);
         w.set_epdis(true);
     });
-    if !wait_for(|| int.read().epdisd()) {
+    // EPENA also confirms the stop if the ISR already consumed EPDISD.
+    if !wait_for(|| !ctl.read().epena()) {
         warn!("timeout during the wait for epdisd on in ep={}", index);
+        return false;
     }
     int.write(|w| w.set_epdisd(true));
+    true
 }
 
 /// Stops a transfer that is in progress on an OUT endpoint.
 ///
 /// The core disables an OUT endpoint only when the global OUT NAK is effective. All the OUT
 /// endpoints share the receive FIFO. Thus this function does not flush that FIFO.
+/// Returns false if the endpoint could not be stopped. The global NAK is released in either case.
 ///
 /// # Interrupts
 ///
@@ -834,13 +892,19 @@ fn abort_in_endpoint(regs: Otg, index: usize) {
 /// constant value, thus the core appears to make the global OUT NAK effective on a boundary
 /// between two frames. The caller pays this time one time for each OUT endpoint that it
 /// disables while the endpoint is active.
-fn abort_out_endpoint(regs: Otg, index: usize) {
+fn abort_out_endpoint(regs: Otg, index: usize) -> bool {
     let ctl = regs.doepctl(index);
     let int = regs.doepint(index);
 
     regs.dctl().modify(|w| w.set_sgonak(true));
-    if !wait_for(|| regs.gintsts().read().goutnakeff()) {
+    if !wait_for(|| regs.gintsts().read().goutnakeff() || !ctl.read().epena()) {
         warn!("timeout during the wait for goutnakeff on out ep={}", index);
+        regs.dctl().modify(|w| w.set_cgonak(true));
+        return false;
+    }
+    if !ctl.read().epena() {
+        regs.dctl().modify(|w| w.set_cgonak(true));
+        return true;
     }
 
     ctl.modify(|w| {
@@ -848,14 +912,18 @@ fn abort_out_endpoint(regs: Otg, index: usize) {
         w.set_epdis(true);
     });
     // The interrupts are not masked here, thus [`on_interrupt`] can clear all the bits of
-    // DOEPINT before this loop reads EPDISD. Thus also accept a clear EPENA, which the core
-    // sets to 0 when it disables the endpoint. The interrupt handler does not write DOEPCTL.
-    if !wait_for(|| int.read().epdisd() || !ctl.read().epena()) {
+    // DOEPINT before this loop reads EPDISD. Check EPENA, which the core sets to 0
+    // when it disables the endpoint. The interrupt handler does not write DOEPCTL.
+    let stopped = wait_for(|| !ctl.read().epena());
+    if !stopped {
         warn!("timeout during the wait for epdisd on out ep={}", index);
+    } else {
+        int.write(|w| w.set_epdisd(true));
     }
-    int.write(|w| w.set_epdisd(true));
 
+    // Release the global NAK even if this endpoint failed to stop.
     regs.dctl().modify(|w| w.set_cgonak(true));
+    stopped
 }
 
 /// Tells if an endpoint of this type has a data toggle that the software must set to DATA0.
@@ -1086,7 +1154,7 @@ where
         r.dctl().write(|w| w.set_sdis(false));
     }
 
-    fn init_fifo(&mut self) {
+    fn init_fifo(&mut self) -> bool {
         trace!("init_fifo");
 
         let regs = self.instance.regs;
@@ -1131,9 +1199,8 @@ where
             );
 
             // Flush fifos, separately
-            flush_tx_fifo(regs, TX_FIFO_ALL);
-            flush_rx_fifo(regs);
-        });
+            flush_tx_fifo(regs, TX_FIFO_ALL) && flush_rx_fifo(regs)
+        })
     }
 
     fn configure_endpoints(&mut self) {
@@ -1141,14 +1208,6 @@ where
 
         let regs = self.instance.regs;
         let st = self.instance.state;
-
-        // Discard the data that the device received before the reset. The FIFOs are empty now.
-        // A packet or a SETUP in these buffers is from the previous session. If the software
-        // keeps this data, the stack receives it as data from after the reset.
-        st.cp_state.setup_ready.store(false, Ordering::Release);
-        for ep in st.ep_states {
-            ep.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
-        }
 
         // Configure IN endpoints
         for index in 0..st.endpoint_count() {
@@ -1158,9 +1217,12 @@ where
                     // during a transfer, EPENA stays set, and it stays set through each
                     // subsequent reset. The endpoint then does not operate again. For endpoint
                     // 0 this makes the device permanently unusable.
-                    if regs.diepctl(index).read().epena() {
-                        abort_in_endpoint(regs, index);
-                        flush_tx_fifo(regs, ep.tx_fifo);
+                    if regs.diepctl(index).read().epena()
+                        && (!abort_in_endpoint(regs, index) || !flush_tx_fifo(regs, ep.tx_fifo))
+                    {
+                        regs.diepctl(index).modify(|w| w.set_usbaep(false));
+                        st.ep_states[index].in_enabled.store(false, Ordering::Release);
+                        return;
                     }
 
                     regs.diepctl(index).write(|w| {
@@ -1174,9 +1236,10 @@ where
                             w.set_snak(true);
                         }
                     });
+                    // Mirror USBAEP: hardwired on for EP0, cleared by the write above for the rest.
+                    // Publish before the ISR can receive the first SETUP.
+                    st.ep_states[index].in_enabled.store(index == 0, Ordering::Release);
                 });
-                // Mirror USBAEP: hardwired on for EP0, cleared by the write above for the rest.
-                st.ep_states[index].in_enabled.store(index == 0, Ordering::Release);
             }
         }
 
@@ -1209,9 +1272,9 @@ where
                             w.set_cnak(true);
                         });
                     }
+                    // Mirror USBAEP: hardwired on for EP0, cleared by the write above for the rest.
+                    st.ep_states[index].out_enabled.store(index == 0, Ordering::Release);
                 });
-                // Mirror USBAEP: hardwired on for EP0, cleared by the write above for the rest.
-                st.ep_states[index].out_enabled.store(index == 0, Ordering::Release);
             }
         }
 
@@ -1331,8 +1394,25 @@ where
             if ints.usbrst() {
                 trace!("reset");
 
-                self.init_fifo();
-                self.configure_endpoints();
+                // Discard the data that the device received before the reset.
+                // A packet or a SETUP in these buffers is from the previous session. If the software
+                // keeps this data, the stack receives it as data from after the reset.
+                st.mutex.lock(|| {
+                    st.cp_state.setup_ready.store(false, Ordering::Release);
+                    for ep in st.ep_states {
+                        ep.in_enabled.store(false, Ordering::Release);
+                        ep.out_enabled.store(false, Ordering::Release);
+                        ep.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+                    }
+                });
+
+                if self.init_fifo() {
+                    self.configure_endpoints();
+                } else {
+                    // Do not arm endpoints with FIFO state from a failed reset.
+                    // Return to bus polling so disconnect or another reset can recover.
+                    self.disable_all_endpoints();
+                }
 
                 // Reset address
                 st.mutex.lock(|| {
@@ -1436,9 +1516,12 @@ where
                     // sequence. If the software only sets STALL, EPENA stays set. The endpoint
                     // then does not operate again.
                     if stalled && regs.diepctl(index).read().epena() {
-                        abort_in_endpoint(regs, index);
-                        if let Some(tx_fifo) = in_tx_fifo {
-                            flush_tx_fifo(regs, tx_fifo);
+                        if !abort_in_endpoint(regs, index)
+                            || in_tx_fifo.is_some_and(|tx_fifo| !flush_tx_fifo(regs, tx_fifo))
+                        {
+                            regs.diepctl(index).modify(|w| w.set_usbaep(false));
+                            st.ep_states[index].in_enabled.store(false, Ordering::Release);
+                            return;
                         }
                     }
 
@@ -1489,11 +1572,14 @@ where
                 // Cancel a transfer that is active. This step is not in the critical section
                 // below, because the interrupt handler must run for the global OUT NAK to
                 // become effective. Refer to [`abort_out_endpoint`].
-                if !enabled && regs.doepctl(ep_addr.index()).read().epena() {
+                if regs.doepctl(ep_addr.index()).read().epena() {
                     abort_out_endpoint(regs, ep_addr.index());
                 }
 
                 st.mutex.lock(|| {
+                    // A previous disable may have timed out. Do not overwrite the
+                    // active transfer's size or PID while its stop is unconfirmed.
+                    let enabled = enabled && !regs.doepctl(ep_addr.index()).read().epena();
                     regs.doepctl(ep_addr.index()).modify(|w| {
                         w.set_usbaep(enabled);
                         // A change of the configuration or of the alternate setting sets the
@@ -1517,19 +1603,28 @@ where
                             });
                         }
                     }
+                    st.ep_states[ep_addr.index()]
+                        .out_enabled
+                        .store(enabled, Ordering::Release);
                 });
-
-                st.ep_states[ep_addr.index()]
-                    .out_enabled
-                    .store(enabled, Ordering::Release);
                 // Wake `Endpoint::wait_enabled()`
                 st.ep_states[ep_addr.index()].out_waker.wake();
             }
             Direction::In => {
                 st.mutex.lock(|| {
                     // cancel transfer if active
-                    if !enabled && regs.diepctl(ep_addr.index()).read().epena() {
-                        abort_in_endpoint(regs, ep_addr.index());
+                    if regs.diepctl(ep_addr.index()).read().epena() && !abort_in_endpoint(regs, ep_addr.index()) {
+                        regs.diepctl(ep_addr.index()).modify(|w| w.set_usbaep(false));
+                        st.ep_states[ep_addr.index()].in_enabled.store(false, Ordering::Release);
+                        return;
+                    }
+
+                    if let Some(ep) = st.ep_alloc_get(Direction::In, ep_addr.index()) {
+                        if !flush_tx_fifo(regs, ep.tx_fifo) {
+                            regs.diepctl(ep_addr.index()).modify(|w| w.set_usbaep(false));
+                            st.ep_states[ep_addr.index()].in_enabled.store(false, Ordering::Release);
+                            return;
+                        }
                     }
 
                     regs.diepctl(ep_addr.index()).modify(|w| {
@@ -1547,14 +1642,10 @@ where
                         }
                     });
 
-                    if let Some(ep) = st.ep_alloc_get(Direction::In, ep_addr.index()) {
-                        flush_tx_fifo(regs, ep.tx_fifo);
-                    }
+                    st.ep_states[ep_addr.index()]
+                        .in_enabled
+                        .store(enabled, Ordering::Release);
                 });
-
-                st.ep_states[ep_addr.index()]
-                    .in_enabled
-                    .store(enabled, Ordering::Release);
                 // Wake `Endpoint::wait_enabled()`
                 st.ep_states[ep_addr.index()].in_waker.wake();
             }
@@ -1691,30 +1782,30 @@ where
         trace!("read start len={}", buf.len());
 
         poll_fn(|cx| {
-            let index = self.info.addr.index();
-            self.state.out_waker.register(cx.waker());
+            self.mutex.lock(|| {
+                let index = self.info.addr.index();
+                self.state.out_waker.register(cx.waker());
 
-            if !self.state.out_enabled.load(Ordering::Acquire) {
-                trace!("read ep={:?} error disabled", self.info.addr);
-                return Poll::Ready(Err(EndpointError::Disabled));
-            }
-
-            let len = self.state.out_size.load(Ordering::Acquire);
-            if len != EP_OUT_BUFFER_EMPTY {
-                trace!("read ep={:?} done len={}", self.info.addr, len);
-
-                if len as usize > buf.len() {
-                    return Poll::Ready(Err(EndpointError::BufferOverflow));
+                if !self.state.out_enabled.load(Ordering::Acquire) {
+                    trace!("read ep={:?} error disabled", self.info.addr);
+                    return Poll::Ready(Err(EndpointError::Disabled));
                 }
 
-                // SAFETY: exclusive access ensured by `out_size` atomic variable
-                let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
-                buf[..len as usize].copy_from_slice(data);
+                let len = self.state.out_size.load(Ordering::Acquire);
+                if len != EP_OUT_BUFFER_EMPTY {
+                    trace!("read ep={:?} done len={}", self.info.addr, len);
 
-                // Release buffer
-                self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+                    if len as usize > buf.len() {
+                        return Poll::Ready(Err(EndpointError::BufferOverflow));
+                    }
 
-                self.mutex.lock(|| {
+                    // SAFETY: FIFO writes, reads, and reset invalidation share this mutex.
+                    let data = unsafe { core::slice::from_raw_parts(*self.state.out_buffer.get(), len as usize) };
+                    buf[..len as usize].copy_from_slice(data);
+
+                    // Release buffer
+                    self.state.out_size.store(EP_OUT_BUFFER_EMPTY, Ordering::Release);
+
                     // Receive 1 packet
                     self.regs.doeptsiz(index).modify(|w| {
                         w.set_xfrsiz(self.info.max_packet_size as _);
@@ -1743,12 +1834,12 @@ where
                         w.set_epena(true);
                         w.set_cnak(true);
                     });
-                });
 
-                Poll::Ready(Ok(len as usize))
-            } else {
-                Poll::Pending
-            }
+                    Poll::Ready(Ok(len as usize))
+                } else {
+                    Poll::Pending
+                }
+            })
         })
         .await
     }
@@ -1794,6 +1885,9 @@ where
         if buf.len() > 0 {
             poll_fn(|cx| {
                 self.state.in_waker.register(cx.waker());
+                if !self.state.in_enabled.load(Ordering::Acquire) {
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
 
                 let size_words = (buf.len() + 3) / 4;
 
@@ -1811,10 +1905,10 @@ where
                     Poll::Pending
                 } else {
                     trace!("write ep={:?} wait for fifo: ready", self.info.addr);
-                    Poll::Ready(())
+                    Poll::Ready(Ok(()))
                 }
             })
-            .await
+            .await?
         }
 
         // ERRATA: Transmit data FIFO is corrupted when a write sequence to the FIFO is interrupted with
@@ -1822,6 +1916,11 @@ where
         //
         // Prevent the interrupt (which might poke FIFOs) from executing while copying data to FIFOs.
         self.mutex.lock(|| {
+            // Reset or a failed handshake may have disabled the endpoint while
+            // this write waited for FIFO space. Recheck before programming it.
+            if !self.state.in_enabled.load(Ordering::Acquire) {
+                return Err(EndpointError::Disabled);
+            }
             // Setup transfer size
             self.regs.dieptsiz(index).write(|w| {
                 w.set_mcnt(1);
@@ -1865,7 +1964,8 @@ where
                 let tmp = u32::from_ne_bytes(tmp);
                 fifo.write_value(regs::Fifo(tmp));
             }
-        });
+            Ok(())
+        })?;
 
         trace!("write done ep={:?}", self.info.addr);
 
@@ -1896,30 +1996,32 @@ where
 
     async fn setup(&mut self) -> [u8; 8] {
         poll_fn(|cx| {
-            self.ep_out.state.out_waker.register(cx.waker());
+            self.mutex.lock(|| {
+                self.ep_out.state.out_waker.register(cx.waker());
 
-            if self.setup_state.setup_ready.load(Ordering::Acquire) {
-                let mut data = [0; 8];
-                data[0..4].copy_from_slice(&self.setup_state.setup_data[0].load(Ordering::Relaxed).to_ne_bytes());
-                data[4..8].copy_from_slice(&self.setup_state.setup_data[1].load(Ordering::Relaxed).to_ne_bytes());
-                self.setup_state.setup_ready.store(false, Ordering::Release);
+                if self.setup_state.setup_ready.load(Ordering::Acquire) {
+                    let mut data = [0; 8];
+                    data[0..4].copy_from_slice(&self.setup_state.setup_data[0].load(Ordering::Relaxed).to_ne_bytes());
+                    data[4..8].copy_from_slice(&self.setup_state.setup_data[1].load(Ordering::Relaxed).to_ne_bytes());
+                    self.setup_state.setup_ready.store(false, Ordering::Release);
 
-                // EP0 should not be controlled by `Bus` so this RMW does not need a critical section
-                self.regs.doeptsiz(self.ep_out.info.addr.index()).modify(|w| {
-                    w.set_rxdpid_stupcnt(3);
-                });
+                    // Keep SETUP consumption and re-arming atomic with reset invalidation.
+                    self.regs.doeptsiz(self.ep_out.info.addr.index()).modify(|w| {
+                        w.set_rxdpid_stupcnt(3);
+                    });
 
-                // Clear NAK to indicate we are ready to receive more data
-                self.regs
-                    .doepctl(self.ep_out.info.addr.index())
-                    .modify(|w| w.set_cnak(true));
+                    // Clear NAK to indicate we are ready to receive more data
+                    self.regs
+                        .doepctl(self.ep_out.info.addr.index())
+                        .modify(|w| w.set_cnak(true));
 
-                trace!("SETUP received: {:?}", Bytes(&data));
-                Poll::Ready(data)
-            } else {
-                trace!("SETUP waiting");
-                Poll::Pending
-            }
+                    trace!("SETUP received: {:?}", Bytes(&data));
+                    Poll::Ready(data)
+                } else {
+                    trace!("SETUP waiting");
+                    Poll::Pending
+                }
+            })
         })
         .await
     }
